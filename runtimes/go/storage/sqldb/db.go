@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -91,7 +92,8 @@ func (db *Database) init() {
 		}
 
 		if !db.noopDB {
-			db.connStr = stdlibdriver.RegisterConnConfig(db.pool.Config().ConnConfig)
+			cfg := db.pool.Config()
+			db.connStr = stdlibdriver.RegisterConnConfig(cfg.ConnConfig, cfg.BeforeConnect)
 		}
 	})
 }
@@ -150,7 +152,16 @@ func dbConf(srv *config.SQLServer, db *config.SQLDatabase, dbNameOverride string
 	if dbName == "" {
 		dbName = db.DatabaseName
 	}
-	uri := fmt.Sprintf("user=%s password=%s dbname=%s", db.User, db.Password, dbName)
+	uri := fmt.Sprintf("user=%s dbname=%s", db.User, dbName)
+
+	// The password stays in the connection string, as apps read it back with
+	// ConnString to open connections of their own. It is quoted, and left out
+	// when empty: an unquoted empty one ("password= dbname=x") would take the
+	// next setting as its value, as keyword/value strings allow spaces after
+	// the "=".
+	if db.Password != "" {
+		uri += " password=" + quoteConnValue(db.Password)
+	}
 
 	// Handle different ways of expressing the host
 	if strings.HasPrefix(srv.Host, "/") {
@@ -161,9 +172,14 @@ func dbConf(srv *config.SQLServer, db *config.SQLDatabase, dbNameOverride string
 		uri += " host=" + srv.Host // hostname
 	}
 
-	if srv.ServerCACert != "" {
+	switch {
+	case srv.ServerCACert != "":
 		uri += " sslmode=verify-ca"
-	} else {
+	case db.AuthMethod == config.SQLAuthGCPIAM:
+		// Never fall back to plaintext: the token is a credential to more than
+		// this database.
+		uri += " sslmode=require"
+	default:
 		uri += " sslmode=prefer"
 	}
 
@@ -177,6 +193,10 @@ func dbConf(srv *config.SQLServer, db *config.SQLDatabase, dbNameOverride string
 	if n := db.MaxConnections; n > 0 {
 		cfg.MaxConns = int32(n)
 	}
+
+	// Spread out connection retirement so connections opened together,
+	// such as after a deploy, don't all reconnect at the same moment.
+	cfg.MaxConnLifetimeJitter = 10 * time.Minute
 
 	// If we have a server CA, set it in the TLS config.
 	if srv.ServerCACert != "" {
@@ -197,7 +217,23 @@ func dbConf(srv *config.SQLServer, db *config.SQLDatabase, dbNameOverride string
 		cfg.ConnConfig.TLSConfig.Certificates = []tls.Certificate{cert}
 	}
 
+	switch db.AuthMethod {
+	case config.SQLAuthPassword:
+	case config.SQLAuthGCPIAM:
+		cfg.BeforeConnect = gcpIAMBeforeConnect
+	default:
+		return nil, fmt.Errorf("unknown auth method %q", db.AuthMethod)
+	}
+
 	return cfg, nil
+}
+
+// quoteConnValue quotes s as a value in a keyword/value connection string,
+// escaping the backslashes and single quotes in it.
+func quoteConnValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `\'`)
+	return "'" + s + "'"
 }
 
 // Exec executes a query without returning any rows.

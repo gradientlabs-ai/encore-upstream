@@ -13,43 +13,56 @@ pub struct Exports {
 }
 
 impl Exports {
-    /// Resolves a relative path to a target file path.
-    pub fn resolve_import_path(
-        &self,
-        rel_path: &str,
-        conditions: &HashSet<&str>,
-    ) -> Option<PathBuf> {
-        let mut wildcard_match = None;
-        for (candidate, subpath) in self.subpaths.iter() {
-            match candidate_matches(candidate, rel_path) {
+    /// Resolves a relative path to candidate target file paths, in priority order.
+    /// The caller should use the first candidate that exists.
+    ///
+    /// As in Node and TypeScript, an exact key wins, and otherwise the most specific
+    /// matching pattern does. That entry alone decides the result: if it gives no
+    /// target, the path isn't exported and less specific patterns aren't tried.
+    pub fn resolve_import_path(&self, rel_path: &str, conditions: &HashSet<&str>) -> Vec<PathBuf> {
+        let mut best: Option<(&str, &Subpath, &str)> = None;
+        for (key, subpath) in self.subpaths.iter() {
+            match candidate_matches(key, rel_path) {
                 None => continue,
                 Some(Match::Exact) => {
-                    return subpath.matches(conditions).and_then(|m| match m {
-                        SubpathMatch::Target(path) => Some(path.into()),
-                        SubpathMatch::Exclude => None,
-                    });
+                    return match subpath.matches(conditions) {
+                        Some(SubpathMatch::Targets(paths)) => {
+                            paths.into_iter().map(PathBuf::from).collect()
+                        }
+                        Some(SubpathMatch::Exclude) | None => vec![],
+                    };
                 }
                 Some(Match::Wildcard { replacement }) => {
-                    match subpath.matches(conditions) {
-                        None => continue,
-
-                        // If we have a target, save it as a candidate.
-                        // We have to keep looking as there may be an exclude directive later.
-                        Some(SubpathMatch::Target(path)) => {
-                            if wildcard_match.is_none() {
-                                wildcard_match = Some((path, replacement));
-                            }
+                    let more_specific = match best {
+                        None => true,
+                        Some((best_key, ..)) => {
+                            pattern_specificity(key) > pattern_specificity(best_key)
                         }
-
-                        // If we have an exclude, stop looking and immediately return none.
-                        Some(SubpathMatch::Exclude) => return None,
+                    };
+                    if more_specific {
+                        best = Some((key, subpath, replacement));
                     }
                 }
             }
         }
 
-        wildcard_match.map(|(path, replacement)| path.replace('*', replacement).into())
+        let Some((_, subpath, replacement)) = best else {
+            return vec![];
+        };
+        match subpath.matches(conditions) {
+            Some(SubpathMatch::Targets(paths)) => paths
+                .into_iter()
+                .map(|path| path.replace('*', replacement).into())
+                .collect(),
+            Some(SubpathMatch::Exclude) | None => vec![],
+        }
     }
+}
+
+/// Orders pattern keys like Node's PATTERN_KEY_COMPARE: a longer prefix before the
+/// "*" is more specific, then a longer key.
+fn pattern_specificity(key: &str) -> (usize, usize) {
+    (key.find('*').unwrap_or(key.len()), key.len())
 }
 
 enum Match<'a> {
@@ -73,7 +86,13 @@ fn candidate_matches<'a>(candidate: &str, rel_path: &'a str) -> Option<Match<'a>
 
     if let Some(idx) = candidate.find('*') {
         let (prefix, suffix) = candidate.split_at(idx);
-        if rel_path.starts_with(prefix) && rel_path.ends_with(suffix) {
+        // Strip the "*" from the suffix.
+        let suffix = &suffix[1..];
+        // The length check keeps the prefix and suffix from overlapping.
+        if rel_path.len() >= prefix.len() + suffix.len()
+            && rel_path.starts_with(prefix)
+            && rel_path.ends_with(suffix)
+        {
             // Get the middle part of the path, to be injected into the result.
             let replacement = &rel_path[prefix.len()..(rel_path.len() - suffix.len())];
             return Some(Match::Wildcard { replacement });
@@ -91,22 +110,40 @@ enum Subpath {
 }
 
 enum SubpathMatch<'a> {
-    Target(&'a str),
+    /// Candidate targets, in priority order. The first one that exists wins.
+    Targets(Vec<&'a str>),
     Exclude,
 }
 
 impl Subpath {
+    /// Returns the targets this subpath maps to under the active conditions.
+    ///
+    /// Like TypeScript, a matching condition doesn't end the search: the targets of
+    /// later matching conditions are kept as fallbacks, in object order. So when a
+    /// "types" target doesn't exist, the "import" target is tried next.
+    /// A null under a condition gives no target, at any nesting level; only a
+    /// subpath that maps directly to null is excluded.
     fn matches(&self, active_conditions: &HashSet<&str>) -> Option<SubpathMatch<'_>> {
         match self {
-            Subpath::Target(path) => Some(SubpathMatch::Target(path)),
+            Subpath::Target(path) => Some(SubpathMatch::Targets(vec![path])),
             Subpath::Exclude => Some(SubpathMatch::Exclude),
             Subpath::Conditions(conds) => {
+                let mut targets = Vec::new();
                 for (cond, subpath) in conds.iter() {
-                    if active_conditions.contains(cond.as_str()) {
-                        return subpath.matches(active_conditions);
+                    if !active_conditions.contains(cond.as_str()) {
+                        continue;
+                    }
+                    // A null target, or nested conditions with no match, gives
+                    // nothing: try the next condition.
+                    if let Some(SubpathMatch::Targets(paths)) = subpath.matches(active_conditions) {
+                        targets.extend(paths);
                     }
                 }
-                None
+                if targets.is_empty() {
+                    None
+                } else {
+                    Some(SubpathMatch::Targets(targets))
+                }
             }
         }
     }
@@ -312,8 +349,199 @@ mod tests {
         .unwrap();
 
         let conditions: HashSet<&str> = ["types", "import", "default"].into_iter().collect();
-        let resolved = exports.resolve_import_path("", &conditions).unwrap();
+        let resolved = exports.resolve_import_path("", &conditions);
         // "types" must win because it appears first in the JSON.
-        assert_eq!(resolved, PathBuf::from("./dist/index.d.ts"));
+        assert_eq!(resolved.first(), Some(&PathBuf::from("./dist/index.d.ts")));
+    }
+
+    fn resolve(exports: &str, rel_path: &str, conditions: &[&str]) -> Vec<PathBuf> {
+        let exports: Exports = serde_json::from_str(exports).unwrap();
+        let conditions: HashSet<&str> = conditions.iter().copied().collect();
+        exports.resolve_import_path(rel_path, &conditions)
+    }
+
+    fn paths(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn condition_fallback_order() {
+        let exports = r#"{
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.mjs",
+            "default": "./dist/index.js"
+        }"#;
+
+        // Object order decides priority, not the order of the active conditions.
+        assert_eq!(
+            resolve(exports, "", &["default", "import", "types"]),
+            paths(&["./dist/index.d.ts", "./dist/index.mjs", "./dist/index.js"])
+        );
+        assert_eq!(
+            resolve(exports, "", &["import", "default"]),
+            paths(&["./dist/index.mjs", "./dist/index.js"])
+        );
+    }
+
+    #[test]
+    fn wildcard_types_falls_back_to_import() {
+        // The "./*" entry of @modelcontextprotocol/sdk >= 1.29.0. For "server/mcp.js" the
+        // "types" target is "dist/esm/server/mcp.js.d.ts", which doesn't exist, so the
+        // "import" target must remain a candidate.
+        let exports = r#"{
+            ".": {
+                "types": "./dist/esm/index.d.ts",
+                "import": "./dist/esm/index.js"
+            },
+            "./*": {
+                "types": "./dist/esm/*.d.ts",
+                "import": "./dist/esm/*",
+                "require": "./dist/cjs/*"
+            }
+        }"#;
+
+        assert_eq!(
+            resolve(exports, "server/mcp.js", &["types", "import", "default"]),
+            paths(&["./dist/esm/server/mcp.js.d.ts", "./dist/esm/server/mcp.js"])
+        );
+    }
+
+    #[test]
+    fn wildcard_with_suffix() {
+        let exports = r#"{"./lib/*.js": "./dist/*.mjs"}"#;
+        assert_eq!(
+            resolve(exports, "lib/a/b.js", &["default"]),
+            paths(&["./dist/a/b.mjs"])
+        );
+        assert_eq!(resolve(exports, "lib/a/b.ts", &["default"]), paths(&[]));
+    }
+
+    #[test]
+    fn nested_conditions_without_match_fall_through() {
+        let exports = r#"{
+            "node": {"import": "./index.node.mjs"},
+            "default": "./index.js"
+        }"#;
+
+        assert_eq!(
+            resolve(exports, "", &["node", "require", "default"]),
+            paths(&["./index.js"])
+        );
+    }
+
+    #[test]
+    fn null_subpath_is_excluded() {
+        let exports = r#"{
+            "./*": "./dist/*.js",
+            "./internal/*": null
+        }"#;
+
+        assert_eq!(resolve(exports, "internal/foo", &["default"]), paths(&[]));
+        assert_eq!(
+            resolve(exports, "foo", &["default"]),
+            paths(&["./dist/foo.js"])
+        );
+        assert_eq!(
+            resolve(r#"{"./foo": null}"#, "foo", &["default"]),
+            paths(&[])
+        );
+    }
+
+    #[test]
+    fn null_condition_is_skipped() {
+        // Like TypeScript, a null under a condition gives no candidate and the search
+        // goes on, at every nesting level.
+        assert_eq!(
+            resolve(
+                r#"{"./internal/*": {"node": null, "default": "./internal/*.js"}}"#,
+                "internal/foo",
+                &["node", "default"]
+            ),
+            paths(&["./internal/foo.js"])
+        );
+        assert_eq!(
+            resolve(
+                r#"{"types": "./index.d.ts", "node": null, "default": "./index.js"}"#,
+                "",
+                &["types", "node", "default"]
+            ),
+            paths(&["./index.d.ts", "./index.js"])
+        );
+        assert_eq!(
+            resolve(
+                r#"{
+                    "outer": {"first": "./missing.js", "second": null},
+                    "default": "./fallback.js"
+                }"#,
+                "",
+                &["outer", "first", "second", "default"]
+            ),
+            paths(&["./missing.js", "./fallback.js"])
+        );
+        assert_eq!(
+            resolve(
+                r#"{"outer": {"second": null}, "default": "./fallback.js"}"#,
+                "",
+                &["outer", "second", "default"]
+            ),
+            paths(&["./fallback.js"])
+        );
+
+        // Only nulls under the active conditions: nothing to resolve.
+        assert_eq!(
+            resolve(r#"{"node": null}"#, "", &["node", "default"]),
+            paths(&[])
+        );
+    }
+
+    #[test]
+    fn most_specific_pattern_wins() {
+        // As in Node and TypeScript, the most specific matching pattern decides the
+        // result, whatever its position in the object.
+        let conditions = &["node", "default"];
+        assert_eq!(
+            resolve(
+                r#"{"./*": "./dist/*.js", "./internal/*": "./internal/*.js"}"#,
+                "internal/foo",
+                conditions
+            ),
+            paths(&["./internal/foo.js"])
+        );
+
+        // A longer prefix before the "*" wins; with equal prefixes, the longer key.
+        assert_eq!(
+            resolve(
+                r#"{"./a/*": "./one/*", "./a/*.js": "./two/*.js"}"#,
+                "a/b.js",
+                conditions
+            ),
+            paths(&["./two/b.js"])
+        );
+
+        // If the most specific pattern resolves to nothing, the path isn't exported:
+        // less specific patterns aren't tried.
+        for exports in [
+            r#"{"./*": "./dist/*.js", "./internal/*": {"node": null}}"#,
+            r#"{"./internal/*": {"node": null}, "./*": "./dist/*.js"}"#,
+            r#"{"./*": "./dist/*.js", "./internal/*": {"browser": "./browser/*.js"}}"#,
+        ] {
+            assert_eq!(
+                resolve(exports, "internal/foo", conditions),
+                paths(&[]),
+                "{exports}"
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_prefix_and_suffix_overlap() {
+        assert_eq!(
+            resolve(r#"{"./ab*bc": "./x/*.js"}"#, "abc", &["default"]),
+            paths(&[])
+        );
+        assert_eq!(
+            resolve(r#"{"./ab*bc": "./x/*.js"}"#, "abxbc", &["default"]),
+            paths(&["./x/x.js"])
+        );
     }
 }
